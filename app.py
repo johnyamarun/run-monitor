@@ -2,77 +2,88 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
 
-# --- 設定 ---
-DATA_FILE = 'my_run_log.csv'
+# --- 設定: Google Sheets連携 ---
+# StreamlitのSecretsから鍵情報を取得
+# Secretsには [gcp_service_account] の下に json_key = """...""" として保存されている前提
+try:
+    key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+    client = gspread.authorize(creds)
+    
+    # スプレッドシートを開く (シート名またはURL)
+    # ※Secretsで指定するか、ハードコードするかですが、ここではURLを直接指定が確実
+    # ★重要: Step 1で作ったシートのURLをここに貼ってください
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxx/edit" 
+    sheet = client.open_by_url(SHEET_URL).sheet1
+except Exception as e:
+    st.error(f"Google Sheets接続エラー: {e}")
+    st.stop()
 
-# --- 1. データ管理機能 (CSV) ---
+# --- 1. データ管理機能 (GSheets版) ---
 def load_data():
-    if not os.path.exists(DATA_FILE):
-        # 初回起動時は空のデータフレームを作成
+    try:
+        data = sheet.get_all_records()
+        if not data:
+            return pd.DataFrame(columns=['Date', 'RHR', 'Distance', 'RPE', 'Type'])
+        df = pd.DataFrame(data)
+        return df
+    except Exception as e:
         return pd.DataFrame(columns=['Date', 'RHR', 'Distance', 'RPE', 'Type'])
-    return pd.read_csv(DATA_FILE)
 
 def save_entry(date, rhr, dist, rpe, session_type):
-    df = load_data()
-    new_data = pd.DataFrame({
-        'Date': [date],
-        'RHR': [rhr],
-        'Distance': [dist],
-        'RPE': [rpe],
-        'Type': [session_type]
-    })
-    # 日付は文字列として保存
-    new_data['Date'] = pd.to_datetime(new_data['Date']).dt.strftime('%Y-%m-%d')
-    
-    # 同じ日付があれば上書き、なければ追加
-    df = pd.concat([df, new_data])
-    df['Date'] = pd.to_datetime(df['Date']) # 日付型に変換
-    df = df.sort_values('Date').drop_duplicates(subset=['Date'], keep='last')
-    
-    # CSVに書き出し
-    df.to_csv(DATA_FILE, index=False)
-    return df
+    # 文字列変換
+    date_str = date.strftime('%Y-%m-%d')
+    # 追加する行データ
+    row = [date_str, rhr, dist, rpe, session_type]
+    # スプレッドシートの末尾に追加
+    sheet.append_row(row)
+    st.toast("スプレッドシートに保存しました！")
 
-# --- 2. 科学的判定ロジック (Colabで実験済みのもの) ---
+# --- 2. 科学的判定ロジック (変更なし) ---
 def analyze_condition(df, today_rhr):
-    # 計算用にコピー
+    # データフレームが空の場合の処理
+    if df.empty:
+        return 100, "GREEN", ["データがありません。入力を開始してください。"], df
+
     calc_df = df.copy()
     calc_df['Date'] = pd.to_datetime(calc_df['Date'])
     calc_df = calc_df.sort_values('Date')
     
-    # 指標計算
+    # 型変換（念のため）
+    calc_df['Distance'] = pd.to_numeric(calc_df['Distance'])
+    calc_df['RPE'] = pd.to_numeric(calc_df['RPE'])
+    calc_df['RHR'] = pd.to_numeric(calc_df['RHR'])
+
     calc_df['Load'] = calc_df['Distance'] * calc_df['RPE']
     calc_df['Acute'] = calc_df['Load'].rolling(7).mean()
     calc_df['Chronic'] = calc_df['Load'].rolling(28).mean()
     
-    # ゼロ除算回避
     calc_df['ACWR'] = calc_df.apply(lambda x: x['Acute']/x['Chronic'] if x['Chronic'] > 0 else 0, axis=1)
     
     calc_df['RHR_Mean'] = calc_df['RHR'].rolling(30).mean()
     calc_df['RHR_Std'] = calc_df['RHR'].rolling(30).std()
-
-    # 最新(昨日)のデータ
-    if len(calc_df) == 0:
-        return 100, "GREEN", ["データがありません。まずは入力を！"], calc_df
 
     last_log = calc_df.iloc[-1]
     
     score = 100
     warnings = []
 
-    # A. 自律神経監査
+    # A. 自律神経
     if not np.isnan(last_log['RHR_Std']) and last_log['RHR_Std'] > 0:
         z_score = (today_rhr - last_log['RHR_Mean']) / last_log['RHR_Std']
         if z_score > 2.0:
             score -= 40
-            warnings.append(f"⛔ 心拍異常 (+2σ): {today_rhr} (平均 {last_log['RHR_Mean']:.1f})")
+            warnings.append(f"⛔ 心拍異常 (+2σ): {today_rhr}")
         elif z_score > 1.0:
             score -= 20
             warnings.append(f"⚠️ 心拍高め (+1σ): {today_rhr}")
 
-    # B. ACWR監査
+    # B. ACWR
     current_acwr = last_log['ACWR']
     if current_acwr > 1.5:
         score -= 30
@@ -81,28 +92,25 @@ def analyze_condition(df, today_rhr):
         score -= 10
         warnings.append(f"⚠️ 急激な負荷増 (ACWR {current_acwr:.2f})")
 
-    # C. 神経監査
+    # C. 神経
     if last_log['Type'] == 'Anaerobic':
         score -= 10
         warnings.append("💡 CNS回復: 昨日は解糖系でした。ジョグ推奨。")
 
-    # 総合判定
     status = "GREEN"
     if score < 50: status = "RED"
     elif score < 80: status = "YELLOW"
 
     return score, status, warnings, calc_df
 
-# --- 3. UI構築 (iPhone向け) ---
+# --- 3. UI構築 ---
 st.set_page_config(page_title="Run Monitor", page_icon="🏃")
-st.title("Run Readiness Monitor")
+st.title("Run Readiness Monitor (Cloud DB)")
 
-# タブ切り替え
-tab1, tab2 = st.tabs(["今日の判定", "昨日のログ入力"])
+tab1, tab2 = st.tabs(["今日の判定", "ログ入力"])
 
-# --- TAB 2: データ入力 ---
 with tab2:
-    st.header("📝 昨日のトレーニング記録")
+    st.header("📝 ログ登録")
     with st.form("log_form"):
         date = st.date_input("日付", datetime.date.today() - datetime.timedelta(days=1))
         rhr = st.number_input("その日のRHR", 40, 100, 45)
@@ -110,44 +118,29 @@ with tab2:
         rpe = st.slider("きつさ (RPE)", 1, 10, 5)
         type_ = st.selectbox("タイプ", ["Jog", "Long", "Tempo", "Interval", "Anaerobic", "Rest"])
         
-        if st.form_submit_button("保存する"):
+        if st.form_submit_button("保存"):
             save_entry(date, rhr, dist, rpe, type_)
-            st.success("保存しました！タブ1に戻って判定してください。")
+            # キャッシュクリアしてリロードしないと最新データが反映されないため
+            st.cache_data.clear()
+            st.success("保存しました！")
 
-# --- TAB 1: 判定 ---
 with tab1:
-    st.header("📊 今日のコンディション")
-    
-    df = load_data()
-    today_rhr = st.number_input("今朝の心拍数 (bpm)", 30, 100, 42)
-    
-    if st.button("判定スタート", type="primary", use_container_width=True):
-        if len(df) < 7:
-            st.info(f"データ蓄積中です... (現在 {len(df)}日分)")
-            # データ不足でも動くようにダミー表示
-            score, status, msgs, res_df = analyze_condition(df, today_rhr)
-        else:
-            score, status, msgs, res_df = analyze_condition(df, today_rhr)
+    st.header("📊 コンディション判定")
+    if st.button("データ読み込み & 判定"):
+        st.cache_data.clear() # 最新データを強制取得
+        df = load_data()
+        today_rhr = st.number_input("今朝の心拍数", 30, 100, 42)
         
-        # 結果表示
+        score, status, msgs, res_df = analyze_condition(df, today_rhr)
+        
         if status == "RED":
             st.error(f"⛔ STOP (Score: {score})")
-            st.write("**推奨:** 完全休養")
         elif status == "YELLOW":
             st.warning(f"⚠️ CAUTION (Score: {score})")
-            st.write("**推奨:** ジョグのみ")
         else:
             st.success(f"✅ GO (Score: {score})")
-            st.write("**推奨:** ポイント練習OK")
 
-        # 理由
-        for msg in msgs:
-            st.info(msg)
-            
-        # グラフ (CPA向け可視化)
-        if len(df) > 0:
-            st.write("---")
-            st.caption("トレンド分析")
-            chart_data = res_df.set_index('Date')[['RHR', 'ACWR']]
-            st.line_chart(chart_data['ACWR'])
-            st.line_chart(chart_data['RHR'])
+        for msg in msgs: st.info(msg)
+        
+        if not res_df.empty:
+            st.line_chart(res_df.set_index('Date')[['ACWR']])
