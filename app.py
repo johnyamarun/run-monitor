@@ -3,31 +3,54 @@ import pandas as pd
 import numpy as np
 import datetime
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials # ← 新しい強力なライブラリ
 import json
 
-# --- 設定: Google Sheets連携 (Chromebook対策版) ---
+# --- 設定: Google Sheets連携 (最強版 V2) ---
 try:
+    # 1. Secretsのチェック
     if "gcp_service_account" not in st.secrets:
-        st.error("Secretsの設定が見つかりません。")
+        st.error("Secrets設定が見つかりません。")
         st.stop()
 
-    # 改行コード削除処理
+    # 2. JSONデータの取得とクリーニング
+    # 改行コード(\n)が勝手に消えたり増えたりしていても、可能な限り復元します
     raw_json = st.secrets["gcp_service_account"]["json_key"]
-    clean_json = raw_json.replace('\n', '').replace('\r', '')
-    key_dict = json.loads(clean_json)
+    
+    # トラブルシューティング: もし中身が空なら止める
+    if not raw_json:
+        st.error("Secretsの 'json_key' が空っぽです。")
+        st.stop()
 
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+    # JSONとして読み込む
+    try:
+        # まずは普通にトライ
+        key_dict = json.loads(raw_json)
+    except json.JSONDecodeError:
+        # 失敗したら、Chromebook特有の「改行削除」を行って再トライ
+        clean_json = raw_json.replace('\n', '').replace('\r', '')
+        key_dict = json.loads(clean_json)
+
+    # 3. 鍵の中身チェック（ここが重要！）
+    if "private_key" not in key_dict:
+        st.error("エラー: 読み込んだデータの中に 'private_key' (秘密鍵) がありません！")
+        st.info(f"読み取れた項目: {list(key_dict.keys())}")
+        st.warning("対処法: 新しいJSONファイルをダウンロードし、Secretsに貼り直してください。")
+        st.stop()
+
+    # 4. 新しい認証方式 (google-auth) で接続
+    # こちらの方が改行コードの扱いに強いです
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
     client = gspread.authorize(creds)
     
-    # ★★★ ここを書き換える！ ★★★
+    # ★★★ ↓↓↓ ここをご自身のURLに書き換えてください！ ↓↓↓ ★★★
     SHEET_URL = "https://docs.google.com/spreadsheets/d/1SnWBBSiXkDwvJ0MFs30dTmBk8TVxQl-7sn8ijMdZ6T4/edit?hl=ja&gid=0#gid=0"
     
     sheet = client.open_by_url(SHEET_URL).sheet1
 
 except Exception as e:
-    st.error(f"接続エラー: {e}")
+    st.error(f"接続エラー詳細: {e}")
     st.stop()
 
 # --- 1. データ管理機能 ---
@@ -67,7 +90,7 @@ def analyze_condition(df, today_rhr):
     calc_df['Acute'] = calc_df['Load'].rolling(7).mean()
     calc_df['Chronic'] = calc_df['Load'].rolling(28).mean()
     
-    # ★ ここがエラーだった箇所です！改行せずに1行で貼り付けてください ★
+    # ACWR計算
     calc_df['ACWR'] = calc_df.apply(lambda x: x['Acute']/x['Chronic'] if x['Chronic'] > 0 else 0, axis=1)
     
     calc_df['RHR_Mean'] = calc_df['RHR'].rolling(30).mean()
@@ -77,7 +100,7 @@ def analyze_condition(df, today_rhr):
     score = 100
     warnings = []
 
-    # A. 自律神経
+    # 判定
     if not np.isnan(last_log['RHR_Std']) and last_log['RHR_Std'] > 0:
         z_score = (today_rhr - last_log['RHR_Mean']) / last_log['RHR_Std']
         if z_score > 2.0:
@@ -87,7 +110,6 @@ def analyze_condition(df, today_rhr):
             score -= 20
             warnings.append(f"⚠️ 心拍高め (+1σ): {today_rhr}")
 
-    # B. ACWR
     current_acwr = last_log['ACWR']
     if current_acwr > 1.5:
         score -= 30
@@ -96,7 +118,6 @@ def analyze_condition(df, today_rhr):
         score -= 10
         warnings.append(f"⚠️ 急激な負荷増 (ACWR {current_acwr:.2f})")
 
-    # C. 神経
     if last_log['Type'] == 'Anaerobic':
         score -= 10
         warnings.append("💡 CNS回復: 昨日は解糖系でした。ジョグ推奨。")
