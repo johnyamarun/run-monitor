@@ -3,43 +3,26 @@ import pandas as pd
 import numpy as np
 import datetime
 import gspread
-from google.oauth2.service_account import Credentials # ← 新しい強力なライブラリ
+from google.oauth2.service_account import Credentials
 import json
 
-# --- 設定: Google Sheets連携 (最強版 V2) ---
+# --- 設定: Google Sheets連携 ---
 try:
-    # 1. Secretsのチェック
     if "gcp_service_account" not in st.secrets:
         st.error("Secrets設定が見つかりません。")
         st.stop()
 
-    # 2. JSONデータの取得とクリーニング
-    # 改行コード(\n)が勝手に消えたり増えたりしていても、可能な限り復元します
     raw_json = st.secrets["gcp_service_account"]["json_key"]
-    
-    # トラブルシューティング: もし中身が空なら止める
     if not raw_json:
-        st.error("Secretsの 'json_key' が空っぽです。")
+        st.error("Secretsが空っぽです。")
         st.stop()
 
-    # JSONとして読み込む
     try:
-        # まずは普通にトライ
         key_dict = json.loads(raw_json)
     except json.JSONDecodeError:
-        # 失敗したら、Chromebook特有の「改行削除」を行って再トライ
         clean_json = raw_json.replace('\n', '').replace('\r', '')
         key_dict = json.loads(clean_json)
 
-    # 3. 鍵の中身チェック（ここが重要！）
-    if "private_key" not in key_dict:
-        st.error("エラー: 読み込んだデータの中に 'private_key' (秘密鍵) がありません！")
-        st.info(f"読み取れた項目: {list(key_dict.keys())}")
-        st.warning("対処法: 新しいJSONファイルをダウンロードし、Secretsに貼り直してください。")
-        st.stop()
-
-    # 4. 新しい認証方式 (google-auth) で接続
-    # こちらの方が改行コードの扱いに強いです
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
     client = gspread.authorize(creds)
@@ -53,13 +36,17 @@ except Exception as e:
     st.error(f"接続エラー詳細: {e}")
     st.stop()
 
-# --- 1. データ管理機能 ---
+# --- 1. データ管理機能 (キャッシュ機能付き) ---
+# 60秒間はデータを記憶して、高速化します
+@st.cache_data(ttl=60)
 def load_data():
     try:
         data = sheet.get_all_records()
         if not data:
             return pd.DataFrame(columns=['Date', 'RHR', 'Distance', 'RPE', 'Type'])
         df = pd.DataFrame(data)
+        # 列名の余計なスペースを削除する安全策
+        df.columns = df.columns.str.strip()
         return df
     except:
         return pd.DataFrame(columns=['Date', 'RHR', 'Distance', 'RPE', 'Type'])
@@ -70,6 +57,8 @@ def save_entry(date, rhr, dist, rpe, session_type):
         row = [date_str, rhr, dist, rpe, session_type]
         sheet.append_row(row)
         st.toast("保存しました！")
+        # 保存したらキャッシュを消して、即座に反映させる
+        st.cache_data.clear()
     except Exception as e:
         st.error(f"保存失敗: {e}")
 
@@ -90,7 +79,6 @@ def analyze_condition(df, today_rhr):
     calc_df['Acute'] = calc_df['Load'].rolling(7).mean()
     calc_df['Chronic'] = calc_df['Load'].rolling(28).mean()
     
-    # ACWR計算
     calc_df['ACWR'] = calc_df.apply(lambda x: x['Acute']/x['Chronic'] if x['Chronic'] > 0 else 0, axis=1)
     
     calc_df['RHR_Mean'] = calc_df['RHR'].rolling(30).mean()
@@ -100,7 +88,6 @@ def analyze_condition(df, today_rhr):
     score = 100
     warnings = []
 
-    # 判定
     if not np.isnan(last_log['RHR_Std']) and last_log['RHR_Std'] > 0:
         z_score = (today_rhr - last_log['RHR_Mean']) / last_log['RHR_Std']
         if z_score > 2.0:
@@ -134,6 +121,7 @@ st.title("Run Readiness Monitor")
 
 tab1, tab2 = st.tabs(["今日の判定", "ログ入力"])
 
+# --- ログ入力タブ ---
 with tab2:
     st.header("📝 ログ登録")
     with st.form("log_form"):
@@ -144,24 +132,39 @@ with tab2:
         type_ = st.selectbox("タイプ", ["Jog", "Long", "Tempo", "Interval", "Anaerobic", "Rest"])
         if st.form_submit_button("保存"):
             save_entry(date, rhr, dist, rpe, type_)
-            st.cache_data.clear()
+            # 保存後は自動で再読み込み
+            st.rerun()
 
+# --- 判定タブ (ここを改良！) ---
 with tab1:
     st.header("📊 コンディション判定")
-    if st.button("データ読み込み & 判定", type="primary"):
+    
+    # 1. データは自動で読み込む (ボタン不要)
+    df = load_data()
+    
+    # 2. 最新データを取得するボタン (必要な時だけ押す)
+    if st.button("🔄 シートの最新データを取得"):
         st.cache_data.clear()
-        df = load_data()
-        today_rhr = st.number_input("今朝の心拍数", 30, 100, 42)
-        score, status, msgs, res_df = analyze_condition(df, today_rhr)
+        st.rerun()
+
+    # 3. 入力フォーム
+    today_rhr = st.number_input("今朝の心拍数", 30, 100, 42)
+    
+    # 4. 常時判定ロジック (ボタンを押さなくても、数値を変えるだけで動く！)
+    score, status, msgs, res_df = analyze_condition(df, today_rhr)
+    
+    if status == "RED":
+        st.error(f"⛔ STOP (Score: {score})")
+        st.write("**推奨:** 完全休養")
+    elif status == "YELLOW":
+        st.warning(f"⚠️ CAUTION (Score: {score})")
+        st.write("**推奨:** ジョグのみ")
+    else:
+        st.success(f"✅ GO (Score: {score})")
+        st.write("**推奨:** ポイント練習OK")
         
-        if status == "RED":
-            st.error(f"⛔ STOP (Score: {score})")
-        elif status == "YELLOW":
-            st.warning(f"⚠️ CAUTION (Score: {score})")
-        else:
-            st.success(f"✅ GO (Score: {score})")
-            
-        for msg in msgs: st.info(msg)
-        
-        if not res_df.empty:
-            st.line_chart(res_df.set_index('Date')[['ACWR']])
+    for msg in msgs: st.info(msg)
+    
+    if not res_df.empty:
+        st.caption("Load Trend (ACWR)")
+        st.line_chart(res_df.set_index('Date')[['ACWR']])
