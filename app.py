@@ -127,7 +127,8 @@ with tab2:
     with st.form("log_form"):
         date = st.date_input("日付", datetime.date.today() - datetime.timedelta(days=1))
         rhr = st.number_input("その日のRHR", 40, 100, 45)
-        dist = st.number_input("距離 (km)", 0.0, 50.0, 10.0)
+        # 整数（0, 50, 10）にすることで、小数点なし＆1km刻みになります
+        dist = st.number_input("距離 (km)", 0, 100, 10)
         rpe = st.slider("きつさ (RPE)", 1, 10, 5)
         type_ = st.selectbox("タイプ", ["Jog", "Long", "Tempo", "Interval", "Anaerobic", "Rest"])
         if st.form_submit_button("保存"):
