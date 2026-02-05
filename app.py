@@ -18,7 +18,7 @@ try:
     # スプレッドシートを開く (シート名またはURL)
     # ※Secretsで指定するか、ハードコードするかですが、ここではURLを直接指定が確実
     # ★重要: Step 1で作ったシートのURLをここに貼ってください
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxx/edit" 
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/1SnWBBSiXkDwvJ0MFs30dTmBk8TVxQl-7sn8ijMdZ6T4/edit?hl=ja&gid=0#gid=0" 
     sheet = client.open_by_url(SHEET_URL).sheet1
 except Exception as e:
     st.error(f"Google Sheets接続エラー: {e}")
